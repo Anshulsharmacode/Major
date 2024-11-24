@@ -6,7 +6,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from sklearn.ensemble import RandomForestClassifier
 from io import BytesIO
 from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt # type: ignore
 import seaborn as sns
 import io
 import base64
@@ -14,7 +14,7 @@ import base64
 # Initialize FastAPI
 app = FastAPI()
 
-# Tumor types mapping
+# Tumor types mapping (including normal image type)
 tumor_types = {
     'adenocarcinoma': 'Non-Small Cell Lung Cancer (NSCLC) - Adenocarcinoma',
     'squamous_cell': 'Non-Small Cell Lung Cancer (NSCLC) - Squamous Cell Carcinoma',
@@ -22,7 +22,8 @@ tumor_types = {
     'small_cell': 'Small Cell Lung Cancer (SCLC)',
     'metastatic': 'Secondary Lung Tumors - Metastatic',
     'hamartoma': 'Benign Lung Tumors - Hamartomas',
-    'pulmonary_adenoma': 'Benign Lung Tumors - Pulmonary Adenomas'
+    'pulmonary_adenoma': 'Benign Lung Tumors - Pulmonary Adenomas',
+    'normal': 'Normal Lung Tissue'
 }
 
 # Initialize the Random Forest model
@@ -82,7 +83,14 @@ async def predict_tumor(file: UploadFile = File(...)):
         
         # Get the predicted label and tumor type
         predicted_label = prediction[0]
+        
+        # Determine the tumor type, including normal
         tumor_type = tumor_types.get(predicted_label, "Unknown Tumor Type")
+        
+        # If it's not a known tumor type, classify it as "Normal"
+        if predicted_label not in tumor_types:
+            tumor_type = tumor_types['normal']
+            predicted_label = 'normal'
         
         # Calculate tumor likelihood
         tumor_score = tumor_likelihood(image_features)
@@ -102,9 +110,9 @@ async def predict_tumor(file: UploadFile = File(...)):
 
 # Training the model with dummy data for demonstration
 def train_model():
-    # Generate dummy data for training
+    # Generate dummy data for training (including a "normal" class)
     X_dummy = np.random.rand(100, 10)  # 100 samples, 10 features
-    y_dummy = np.random.choice(list(tumor_types.keys()), size=100)  # Random labels from tumor_types
+    y_dummy = np.random.choice(list(tumor_types.keys()), size=100)  # Random labels from tumor_types, including 'normal'
 
     # Split the dummy data into training and testing
     X_train, X_test, y_train, y_test = train_test_split(X_dummy, y_dummy, test_size=0.2, random_state=42)
@@ -114,9 +122,6 @@ def train_model():
 
 # Call the training function when the application starts
 train_model()
-
-# To run this FastAPI application, use the command:
-# uvicorn main:app --host 0.0.0.0 --port 5000
 
 def tumor_likelihood(image_features):
     weights = {
@@ -209,8 +214,9 @@ def generate_plots(image_array, image_features):
     return plots
 
 def plot_to_base64(plt):
+    """Converts matplotlib plot to base64 string."""
     buf = io.BytesIO()
-    plt.savefig(buf, format='png')
+    plt.savefig(buf, format="png")
     plt.close()
     buf.seek(0)
-    return base64.b64encode(buf.getvalue()).decode('utf-8')
+    return base64.b64encode(buf.read()).decode('utf-8')
