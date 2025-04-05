@@ -16,7 +16,7 @@ def main():
             files = {'file': ('image.jpg', uploaded_file.getvalue(), 'image/jpeg')}
             
             try:
-                response = requests.post('https://major-xt6n.onrender.com/predict-tumor/', files=files)
+                response = requests.post('http://localhost:8000/predict-tumor/', files=files)
                 response.raise_for_status()
                 result = response.json()
                 
