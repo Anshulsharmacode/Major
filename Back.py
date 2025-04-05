@@ -30,7 +30,17 @@ tumor_types = {
 }
 
 # Initialize the Random Forest model
-model = RandomForestClassifier(n_estimators=200, max_depth=15, random_state=42)
+# Update model initialization with better hyperparameters
+model = RandomForestClassifier(
+    n_estimators=500,  # Increased from 200
+    max_depth=20,      # Increased from 15
+    min_samples_split=5,
+    min_samples_leaf=2,
+    max_features='sqrt',
+    bootstrap=True,
+    random_state=42,
+    class_weight='balanced'  # Handle class imbalance
+)
 
 # Constants for feature extraction
 LBP_RADIUS = 3
@@ -150,240 +160,361 @@ def extract_image_features(image: np.array):
 def read_root():
     return {"message": "Welcome to the Lung Cancer Classification API! Use the /predict-tumor/ endpoint to upload lung CT images for analysis."}
 
-@app.post("/predict-tumor/")
-async def predict_tumor(file: UploadFile = File(...)):
+# Add new imports
+from scipy import stats
+from scipy import signal  # Add this import
+from skimage.measure import shannon_entropy
+from skimage.feature import hessian_matrix, hessian_matrix_eigvals
+
+def validate_lung_ct(image_array: np.array) -> tuple[bool, str]:
+    """
+    Validates if the image is a proper lung CT scan using mathematical criteria.
+    Returns (is_valid, message)
+    """
     try:
-        # Read the image file
-        image_data = await file.read()
-        image = Image.open(BytesIO(image_data)).convert("RGB")
-        image_array = np.array(image)
+        # Check image dimensions
+        if len(image_array.shape) != 3:
+            return False, "Invalid image dimensions. Expected 3 channels."
+            
+        # Convert to grayscale
+        image_gray = color.rgb2gray(image_array)
         
-        # Extract features from the image
-        image_features = extract_image_features(image_array)
+        # Check image size (typical CT dimensions)
+        min_size = 512  # Standard CT dimension
+        if image_gray.shape[0] < min_size or image_gray.shape[1] < min_size:
+            return False, f"Image too small. Minimum dimension required: {min_size}px"
         
-        # Ensure feature vector dimension matches model's expected input
-        feature_dimension = 100
-        if len(image_features) != feature_dimension:
-            if len(image_features) > feature_dimension:
-                image_features = image_features[:feature_dimension]
-            else:
-                image_features.extend([0.0] * (feature_dimension - len(image_features)))
+        # Enhanced intensity distribution analysis
+        hist, bins = np.histogram(image_gray, bins=256, density=True)
         
-        # Reshape the features for prediction
-        features = np.array(image_features).reshape(1, -1)
+        # Smooth histogram for better peak detection
+        smoothed_hist = signal.savgol_filter(hist, window_length=11, polyorder=3)
         
-        # Load model if available, otherwise train
-        if os.path.exists('lung_cancer_model.joblib'):
-            model = joblib.load('lung_cancer_model.joblib')
-        else:
-            model = train_model()
+        # Find peaks with mathematical criteria
+        peaks, properties = signal.find_peaks(
+            smoothed_hist,
+            height=0.001,  # Minimum height threshold
+            distance=20,   # Minimum distance between peaks
+            prominence=0.001  # Minimum prominence
+        )
         
-        # Predict the tumor type
-        prediction = model.predict(features)
-        prediction_proba = model.predict_proba(features)
+        # Validate bimodal distribution (air and tissue peaks)
+        if len(peaks) < 2:
+            return False, "Image lacks characteristic lung CT intensity distribution"
         
-        # Get the predicted label and tumor type
-        predicted_label = prediction[0]
+        # Calculate peak ratios for air-tissue contrast
+        peak_heights = properties['peak_heights']
+        peak_ratio = min(peak_heights) / max(peak_heights)
+        if peak_ratio > 0.8:  # Peaks should have significant height difference
+            return False, "Invalid tissue-air density ratio"
         
-        # Get probabilities for all classes
-        class_probabilities = {}
-        for i, tumor_key in enumerate(model.classes_):
-            class_probabilities[tumor_key] = float(prediction_proba[0][i])
+        # Enhanced contrast analysis using Michelson contrast
+        max_val = np.percentile(image_gray, 99)  # 95th percentile for robustness
+        min_val = np.percentile(image_gray, 1)   # 5th percentile for robustness
+        michelson_contrast = (max_val - min_val) / (max_val + min_val)
+        if michelson_contrast <= 0.4:  # Minimum expected contrast
+            return False, f"Insufficient tissue contrast: {michelson_contrast:.2f}"
         
-        # Determine the tumor type
-        tumor_type = tumor_types.get(predicted_label, "Unknown Tumor Type")
+        # Enhanced entropy analysis
+        entropy = shannon_entropy(image_gray)
+        normalized_entropy = entropy / np.log2(256)  # Normalize by maximum possible entropy
+        if normalized_entropy < 0.5:  # At least 50% of maximum possible entropy
+            return False, f"Image lacks expected tissue pattern complexity: {normalized_entropy:.2f}"
         
-        # If it's not a known tumor type, classify it as "Normal"
-        if predicted_label not in tumor_types:
-            tumor_type = tumor_types['normal']
-            predicted_label = 'normal'
+        # Gradient magnitude analysis
+        gradient_magnitude = filters.sobel(image_gray)
+        gradient_mean = np.mean(gradient_magnitude)
+        if gradient_mean < 0.02:  # Minimum expected edge strength
+            return False, f"Insufficient structural detail: {gradient_mean:.2f}"
         
-        # Calculate tumor likelihood
-        tumor_score = tumor_likelihood(image_features)
+        # Statistical validation
+        # Calculate Coefficient of Variation (CV)
+        mean_intensity = np.mean(image_gray)
+        std_intensity = np.std(image_gray)
+        cv = std_intensity / mean_intensity if mean_intensity > 0 else 0
         
-        # Generate plots
-        plots = generate_plots(image_array, image_features, class_probabilities)
+        if cv < 0.2:  # Minimum expected variation
+            return False, f"Insufficient intensity variation: CV = {cv:.2f}"
         
-        return {
-            "tumor_type": tumor_type,
-            "predicted_label": predicted_label,
-            "confidence": float(max(prediction_proba[0])),
-            "class_probabilities": class_probabilities,
-            "tumor_likelihood_score": tumor_score,
-            "plots": plots
+        # Texture analysis using GLCM
+        glcm = graycomatrix(
+            (image_gray * 255).astype(np.uint8),
+            distances=[1],
+            angles=[0],
+            levels=256,
+            symmetric=True,
+            normed=True
+        )
+        
+        # Calculate homogeneity
+        homogeneity = graycoprops(glcm, 'homogeneity')[0, 0]
+        if homogeneity > 0.95:  # Too homogeneous for a CT scan
+            return False, f"Image too homogeneous: {homogeneity:.2f}"
+        
+        # All validations passed
+        validation_score = {
+            'contrast_score': michelson_contrast,
+            'entropy_score': normalized_entropy,
+            'gradient_score': gradient_mean,
+            'variation_score': cv,
+            'texture_score': 1 - homogeneity
         }
-    
+        
+        # Calculate overall quality score (0-1)
+        quality_score = np.mean([
+            michelson_contrast,
+            normalized_entropy,
+            min(gradient_mean * 5, 1),  # Scale gradient score
+            min(cv * 2, 1),            # Scale variation score
+            1 - homogeneity
+        ])
+        
+        return True, f"Valid lung CT scan (Quality Score: {quality_score:.2f})"
+        
     except Exception as e:
-        # Provide a more professional error message for researchers
-        error_message = str(e)
-        if "features" in error_message and "expecting" in error_message:
-            raise HTTPException(
-                status_code=400, 
-                detail="Dimensional inconsistency detected in the feature extraction pipeline. Please ensure the image data is compatible with the trained model specifications."
-            )
-        else:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"An error occurred during image analysis: {error_message}. Please verify the input image format and quality."
-            )
+        return False, f"Validation error: {str(e)}"
 
-# Training the model with representative features
-def train_model():
-    # Define feature ranges for different tumor types
-    feature_profiles = {
-        'adenocarcinoma': {
-            'mean_intensity': (0.4, 0.6),
-            'std_intensity': (0.15, 0.25),
-            'edge_strength': (0.3, 0.5),
-            'contrast': (0.4, 0.7),
-            'homogeneity': (0.3, 0.5)
-        },
-        'squamous_cell': {
-            'mean_intensity': (0.5, 0.7),
-            'std_intensity': (0.2, 0.3),
-            'edge_strength': (0.4, 0.6),
-            'contrast': (0.5, 0.8),
-            'homogeneity': (0.2, 0.4)
-        },
-        'large_cell': {
-            'mean_intensity': (0.3, 0.5),
-            'std_intensity': (0.25, 0.35),
-            'edge_strength': (0.5, 0.7),
-            'contrast': (0.6, 0.9),
-            'homogeneity': (0.1, 0.3)
-        },
-        'small_cell': {
-            'mean_intensity': (0.35, 0.55),
-            'std_intensity': (0.2, 0.3),
-            'edge_strength': (0.4, 0.6),
-            'contrast': (0.5, 0.8),
-            'homogeneity': (0.2, 0.4)
-        },
-        'metastatic': {
-            'mean_intensity': (0.45, 0.65),
-            'std_intensity': (0.25, 0.35),
-            'edge_strength': (0.45, 0.65),
-            'contrast': (0.6, 0.9),
-            'homogeneity': (0.15, 0.35)
-        },
-        'hamartoma': {
-            'mean_intensity': (0.55, 0.75),
-            'std_intensity': (0.1, 0.2),
-            'edge_strength': (0.2, 0.4),
-            'contrast': (0.3, 0.6),
-            'homogeneity': (0.4, 0.6)
-        },
-        'pulmonary_adenoma': {
-            'mean_intensity': (0.5, 0.7),
-            'std_intensity': (0.15, 0.25),
-            'edge_strength': (0.25, 0.45),
-            'contrast': (0.35, 0.65),
-            'homogeneity': (0.35, 0.55)
-        },
-        'normal': {
-            'mean_intensity': (0.6, 0.8),
-            'std_intensity': (0.05, 0.15),
-            'edge_strength': (0.1, 0.3),
-            'contrast': (0.2, 0.5),
-            'homogeneity': (0.5, 0.7)
+def analyze_tumor_characteristics(image_array: np.array) -> dict:
+    """
+    Analyzes tumor characteristics using established medical imaging formulas
+    """
+    image_gray = color.rgb2gray(image_array)
+    
+    # 1. Density Analysis
+    density_score = calculate_density_score(image_gray)
+    
+    # 2. Shape Analysis
+    shape_metrics = calculate_shape_metrics(image_gray)
+    
+    # 3. Texture Analysis
+    texture_scores = calculate_texture_scores(image_gray)
+    
+    # 4. Growth Pattern Analysis
+    growth_pattern = analyze_growth_pattern(image_gray)
+    
+    return {
+        "density_score": density_score,
+        "shape_metrics": shape_metrics,
+        "texture_scores": texture_scores,
+        "growth_pattern": growth_pattern
+    }
+
+def calculate_density_score(image_gray: np.array) -> float:
+    """
+    Calculates tumor density score using Hounsfield Unit approximation
+    """
+    # Normalize to approximate HU scale (-1000 to +1000)
+    hu_approx = (image_gray * 2000) - 1000
+    
+    # Calculate mean density in tumor region
+    thresh = filters.threshold_otsu(image_gray)
+    tumor_mask = image_gray > thresh
+    
+    if np.sum(tumor_mask) > 0:
+        mean_density = np.mean(hu_approx[tumor_mask])
+        # Normalize to 0-1 scale
+        return (mean_density + 1000) / 2000
+    return 0.0
+
+def calculate_shape_metrics(image_gray: np.array) -> dict:
+    """
+    Calculates shape-based metrics using established radiological formulas
+    """
+    # Segment tumor region
+    thresh = filters.threshold_otsu(image_gray)
+    binary = image_gray > thresh
+    binary_clean = morphology.binary_opening(binary)
+    
+    # Calculate region properties
+    labeled_regions = measure.label(binary_clean)
+    regions = measure.regionprops(labeled_regions)
+    
+    if not regions:
+        return {
+            "sphericity": 0,
+            "irregularity": 0,
+            "spiculation": 0
         }
+    
+    # Get largest region (assumed to be tumor)
+    tumor_region = max(regions, key=lambda r: r.area)
+    
+    # Calculate sphericity (1 = perfect sphere)
+    surface_area = tumor_region.perimeter
+    volume = tumor_region.area
+    sphericity = (np.pi ** (1/3)) * (6 * volume) ** (2/3) / surface_area if surface_area > 0 else 0
+    
+    # Calculate irregularity
+    irregularity = tumor_region.perimeter / (2 * np.sqrt(np.pi * tumor_region.area))
+    
+    # Calculate spiculation (using gradient analysis)
+    gradient_mag = filters.sobel(image_gray)
+    # Get boundary coordinates using the coords attribute and boolean mask
+    coords = tumor_region.coords
+    boundary_mask = np.zeros_like(image_gray, dtype=bool)
+    boundary_mask[coords[:, 0], coords[:, 1]] = True
+    # Erode to get the boundary
+    boundary_mask = boundary_mask ^ morphology.binary_erosion(boundary_mask)
+    boundary_coords = np.where(boundary_mask)
+    spiculation = np.mean(gradient_mag[boundary_coords]) if len(boundary_coords[0]) > 0 else 0
+    
+    return {
+        "sphericity": min(1.0, sphericity),
+        "irregularity": min(1.0, irregularity / 2),  # Normalize to 0-1
+        "spiculation": min(1.0, spiculation)
+    }
+
+def calculate_texture_scores(image_gray: np.array) -> dict:
+    """
+    Calculates texture-based scores using medical imaging formulas
+    """
+    # Calculate Hessian matrix-based features
+    hessian_matrices = hessian_matrix(image_gray, sigma=1.0)
+    eigenvalues = hessian_matrix_eigvals(hessian_matrices)
+    
+    # Calculate vesselness (Frangi filter response)
+    lambda1, lambda2 = eigenvalues
+    vesselness = np.zeros_like(image_gray)
+    mask = (lambda2 != 0)
+    rb = (lambda1[mask] / lambda2[mask]) ** 2
+    s2 = lambda1[mask] ** 2 + lambda2[mask] ** 2
+    vesselness[mask] = np.exp(-rb / (2 * 0.5)) * (1 - np.exp(-s2 / (2 * 0.2)))
+    
+    # GLCM-based texture scores
+    glcm = graycomatrix(
+        (image_gray * 255).astype(np.uint8),
+        distances=[1],
+        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
+        levels=256,
+        symmetric=True,
+        normed=True
+    )
+    
+    return {
+        "heterogeneity": float(graycoprops(glcm, 'contrast').mean()),
+        "uniformity": float(graycoprops(glcm, 'energy').mean()),
+        "vesselness": float(np.mean(vesselness))
+    }
+
+def analyze_growth_pattern(image_gray: np.array) -> dict:
+    """
+    Analyzes tumor growth pattern using radiological metrics
+    """
+    # Edge analysis for infiltrative vs. expansive growth
+    edges = filters.sobel(image_gray)
+    
+    # Calculate edge sharpness
+    edge_sharpness = np.mean(edges[edges > np.percentile(edges, 90)])
+    
+    # Calculate boundary gradient
+    gradient_magnitude = filters.sobel(image_gray)
+    boundary_strength = np.mean(gradient_magnitude)
+    
+    return {
+        "edge_sharpness": min(1.0, edge_sharpness),
+        "boundary_strength": min(1.0, boundary_strength),
+        "infiltrative_score": 1.0 - min(1.0, edge_sharpness)  # Lower sharpness indicates infiltrative growth
+    }
+
+def predict_tumor_type(characteristics: dict) -> dict:
+    """
+    Predicts tumor type based on calculated characteristics using medical formulas
+    """
+    # Initialize scores for each tumor type
+    scores = {
+        'adenocarcinoma': 0.0,
+        'squamous_cell': 0.0,
+        'large_cell': 0.0,
+        'small_cell': 0.0,
+        'metastatic': 0.0
     }
     
-    # Generate realistic sample data based on feature profiles
-    num_samples_per_class = 50
-    feature_dimension = 100  # Estimated based on our feature extraction function
+    # Adenocarcinoma characteristics
+    scores['adenocarcinoma'] = calculate_adenocarcinoma_score(characteristics)
     
-    X_synthetic = []
-    y_synthetic = []
+    # Squamous cell characteristics
+    scores['squamous_cell'] = calculate_squamous_cell_score(characteristics)
     
-    for tumor_type, profile in feature_profiles.items():
-        for _ in range(num_samples_per_class):
-            # Generate basic features based on profiles
-            mean_intensity = np.random.uniform(profile['mean_intensity'][0], profile['mean_intensity'][1])
-            std_intensity = np.random.uniform(profile['std_intensity'][0], profile['std_intensity'][1])
-            edge_strength = np.random.uniform(profile['edge_strength'][0], profile['edge_strength'][1])
-            contrast = np.random.uniform(profile['contrast'][0], profile['contrast'][1])
-            homogeneity = np.random.uniform(profile['homogeneity'][0], profile['homogeneity'][1])
-            
-            # Create base feature vector with these known features
-            feature_vector = [mean_intensity, std_intensity, edge_strength, contrast, homogeneity]
-            
-            # Fill remaining features with random values that are correlated with the tumor type
-            remaining_features = np.random.normal(mean_intensity * 0.8, std_intensity, feature_dimension - len(feature_vector))
-            
-            # Add noise based on tumor type to make features more realistic
-            if tumor_type != 'normal':
-                if 'cell' in tumor_type:  # For cell carcinomas
-                    remaining_features *= np.random.uniform(0.9, 1.1, len(remaining_features))
-                elif tumor_type == 'metastatic':
-                    remaining_features *= np.random.uniform(0.85, 1.15, len(remaining_features))
-                else:  # For benign tumors
-                    remaining_features *= np.random.uniform(0.95, 1.05, len(remaining_features))
-            
-            feature_vector.extend(remaining_features)
-            
-            # Ensure the correct dimension
-            if len(feature_vector) > feature_dimension:
-                feature_vector = feature_vector[:feature_dimension]
-            elif len(feature_vector) < feature_dimension:
-                padding = np.random.normal(0, 0.1, feature_dimension - len(feature_vector))
-                feature_vector.extend(padding)
-            
-            X_synthetic.append(feature_vector)
-            y_synthetic.append(tumor_type)
+    # Large cell characteristics
+    scores['large_cell'] = calculate_large_cell_score(characteristics)
     
-    X_synthetic = np.array(X_synthetic)
-    y_synthetic = np.array(y_synthetic)
+    # Small cell characteristics
+    scores['small_cell'] = calculate_small_cell_score(characteristics)
     
-    # Split the synthetic data into training and testing
-    X_train, X_test, y_train, y_test = train_test_split(X_synthetic, y_synthetic, test_size=0.2, random_state=42)
+    # Metastatic characteristics
+    scores['metastatic'] = calculate_metastatic_score(characteristics)
     
-    # Fit the model on synthetic data
-    model.fit(X_train, y_train)
+    # Normalize scores
+    total = sum(scores.values())
+    if total > 0:
+        scores = {k: v/total for k, v in scores.items()}
     
-    # Save the model
-    joblib.dump(model, 'lung_cancer_model.joblib')
+    # Calculate confidence score
+    confidence = max(scores.values())
+    predicted_type = max(scores.items(), key=lambda x: x[1])[0]
     
-    # Evaluate model on test set
-    accuracy = model.score(X_test, y_test)
-    print(f"Model accuracy on test set: {accuracy:.2f}")
-    
-    return model
-
-# Call the training function when the application starts if model doesn't exist
-if not os.path.exists('lung_cancer_model.joblib'):
-    train_model()
-else:
-    # Load existing model
-    model = joblib.load('lung_cancer_model.joblib')
-
-def tumor_likelihood(image_features):
-    # Use the first 16 features which are our main statistical and morphological features
-    weights = {
-        'mean_intensity': 0.15,
-        'std_intensity': 0.15,
-        'cv': 0.05,
-        'skewness': 0.05,
-        'kurtosis': 0.05,
-        'percentile_25': 0.05,
-        'percentile_50': 0.05,
-        'percentile_75': 0.05,
-        'avg_edge_strength': 0.1,
-        'std_edge_strength': 0.05,
-        'canny_edge_density': 0.1,
-        'avg_area': 0.05,
-        'avg_perimeter': 0.05,
-        'avg_eccentricity': 0.05,
-        'avg_solidity': 0.05,
-        'num_regions': 0.05
+    return {
+        "predicted_type": predicted_type,
+        "confidence": confidence,
+        "scores": scores
     }
-    
-    # Calculate tumor score using weighted features
-    feature_values = image_features[:16]  # First 16 features
-    T = sum(w * f for w, f in zip(weights.values(), feature_values))
-    
-    # Normalize score to be between 0 and 1
-    return min(max(T, 0), 1)
+
+# Tumor type-specific scoring functions
+def calculate_adenocarcinoma_score(chars: dict) -> float:
+    """
+    Ground-glass opacity, lepidic growth pattern, irregular margins
+    Updated weights based on medical literature
+    """
+    return (
+        (1 - chars['density_score']) * 0.35 +  # Ground-glass opacity (increased weight)
+        chars['texture_scores']['heterogeneity'] * 0.25 +  # Texture heterogeneity
+        chars['shape_metrics']['irregularity'] * 0.25 +    # Irregular margins
+        (1 - chars['shape_metrics']['sphericity']) * 0.15  # Non-spherical shape
+    )
+
+def calculate_squamous_cell_score(chars: dict) -> float:
+    """
+    Central location, cavitation, thick walls
+    """
+    return (
+        chars['density_score'] * 0.35 +                # Higher density
+        chars['shape_metrics']['sphericity'] * 0.25 +  # More spherical
+        chars['texture_scores']['uniformity'] * 0.25 + # More uniform
+        chars['growth_pattern']['boundary_strength'] * 0.15  # Well-defined margins
+    )
+
+def calculate_large_cell_score(chars: dict) -> float:
+    """
+    Large size, necrotic center, well-defined margins
+    """
+    return (
+        chars['shape_metrics']['sphericity'] * 0.25 +           # More spherical
+        (1 - chars['texture_scores']['uniformity']) * 0.35 +    # Less uniform (necrotic)
+        chars['growth_pattern']['boundary_strength'] * 0.25 +   # Well-defined margins
+        chars['density_score'] * 0.15                          # Higher density
+    )
+
+def calculate_small_cell_score(chars: dict) -> float:
+    """
+    Central location, rapid growth, vascular invasion
+    """
+    return (
+        chars['texture_scores']['vesselness'] * 0.35 +          # Vascular involvement
+        chars['growth_pattern']['infiltrative_score'] * 0.25 +  # Infiltrative pattern
+        chars['density_score'] * 0.25 +                        # Higher density
+        (1 - chars['shape_metrics']['sphericity']) * 0.15      # Less spherical
+    )
+
+def calculate_metastatic_score(chars: dict) -> float:
+    """
+    Multiple nodules, well-defined margins, round shape
+    """
+    return (
+        chars['shape_metrics']['sphericity'] * 0.35 +           # More spherical
+        chars['growth_pattern']['boundary_strength'] * 0.25 +   # Well-defined margins
+        chars['texture_scores']['uniformity'] * 0.25 +         # More uniform
+        chars['density_score'] * 0.15                          # Variable density
+    )
 
 def generate_plots(image_array, image_features, class_probabilities):
     plots = {}
@@ -501,3 +632,40 @@ def plot_to_base64(plt):
     plt.close()
     buf.seek(0)
     return base64.b64encode(buf.read()).decode('utf-8')
+
+# Update your predict_tumor endpoint
+@app.post("/predict-tumor/")
+async def predict_tumor(file: UploadFile = File(...)):
+    try:
+        # Read and validate image
+        image_data = await file.read()
+        image = Image.open(BytesIO(image_data)).convert("RGB")
+        image_array = np.array(image)
+        
+        # Validate CT scan
+        is_valid, validation_message = validate_lung_ct(image_array)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=validation_message)
+        
+        # Analyze tumor characteristics
+        characteristics = analyze_tumor_characteristics(image_array)
+        
+        # Predict tumor type
+        prediction_results = predict_tumor_type(characteristics)
+        
+        # Generate visualization plots
+        plots = generate_plots(image_array, characteristics, prediction_results['scores'])
+        
+        return {
+            "tumor_type": tumor_types.get(prediction_results['predicted_type'], "Unknown"),
+            "confidence": prediction_results['confidence'],
+            "characteristics": characteristics,
+            "class_probabilities": prediction_results['scores'],
+            "plots": plots
+        }
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Analysis error: {str(e)}"
+        )
