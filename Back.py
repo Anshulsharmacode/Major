@@ -48,74 +48,119 @@ LBP_N_POINTS = 8 * LBP_RADIUS
 DISTANCES = [1, 3, 5]
 ANGLES = [0, np.pi/4, np.pi/2, 3*np.pi/4]
 
+# Add new imports
+from scipy.stats import entropy
+from skimage.feature import peak_local_max
+from skimage.filters import gaussian
+
+# Enhanced model parameters for better accuracy
+model = RandomForestClassifier(
+    n_estimators=1000,    # Increased for better generalization
+    max_depth=25,         # Slightly increased
+    min_samples_split=4,
+    min_samples_leaf=2,
+    max_features='sqrt',
+    bootstrap=True,
+    random_state=42,
+    class_weight='balanced_subsample',  # Better handling of imbalanced data
+    n_jobs=-1             # Use all CPU cores
+)
+
+# Enhanced feature extraction constants
+LBP_RADIUS = 10           # Increased for better texture capture
+LBP_N_POINTS = 12 * LBP_RADIUS
+DISTANCES = [1, 2, 3, 4, 5]  # More distances for better texture analysis
+ANGLES = [0, np.pi/6, np.pi/4, np.pi/3, np.pi/2, 2*np.pi/3, 3*np.pi/4, 5*np.pi/6]  # More angles
+
 def extract_image_features(image: np.array):
-    """Extract comprehensive features from a given image array and ensure dimensional consistency with trained model."""
-    if image.shape[-1] == 4:  # Handle RGBA images
+    """Enhanced feature extraction with advanced image analysis"""
+    if image.shape[-1] == 4:
         image = color.rgba2rgb(image)
 
-    # Convert to grayscale and normalize
+    # Convert to grayscale and enhance contrast
     image_gray = color.rgb2gray(image)
     image_normalized = (image_gray - np.min(image_gray)) / (np.max(image_gray) - np.min(image_gray))
     
-    # Basic statistical features
-    mean_intensity = np.mean(image_normalized)
-    std_intensity = np.std(image_normalized)
-    cv = std_intensity / mean_intensity if mean_intensity > 0 else 0
-    skewness = np.mean(((image_normalized - mean_intensity) / std_intensity)**3) if std_intensity > 0 else 0
-    kurtosis = np.mean(((image_normalized - mean_intensity) / std_intensity)**4) if std_intensity > 0 else 0
+    # Apply Gaussian smoothing to reduce noise
+    image_smooth = gaussian(image_normalized, sigma=1.0)
     
-    # Percentiles
-    percentile_25 = np.percentile(image_normalized, 25)
-    percentile_50 = np.percentile(image_normalized, 50)
-    percentile_75 = np.percentile(image_normalized, 75)
+    # Enhanced statistical features
+    features = []
     
-    # Edge features
-    edges_sobel = filters.sobel(image_normalized)
-    avg_edge_strength = np.mean(edges_sobel)
-    std_edge_strength = np.std(edges_sobel)
-    
-    # Canny edge detection
-    edges_canny = feature.canny(image_normalized, sigma=1.0)
-    canny_edge_density = np.mean(edges_canny)
-    
-    # Morphological features
-    # Binarize image using Otsu's thresholding
+    # Multi-scale analysis
+    for sigma in [1, 2, 4]:
+        img_scale = gaussian(image_normalized, sigma=sigma)
+        
+        # Basic statistics
+        features.extend([
+            np.mean(img_scale),
+            np.std(img_scale),
+            entropy(img_scale.ravel()),
+            np.percentile(img_scale, [10, 25, 50, 75, 90]).tolist()
+        ])
+        
+        # Edge features at multiple scales
+        edges_sobel = filters.sobel(img_scale)
+        edges_canny = feature.canny(img_scale, sigma=sigma)
+        
+        features.extend([
+            np.mean(edges_sobel),
+            np.std(edges_sobel),
+            np.mean(edges_canny),
+            np.sum(edges_canny) / edges_canny.size  # Edge density
+        ])
+
+    # Enhanced morphological analysis
     thresh = filters.threshold_otsu(image_normalized)
     binary = image_normalized > thresh
-    
-    # Remove noise with morphological operations
     binary_clean = morphology.binary_opening(binary)
-    binary_clean = morphology.binary_closing(binary_clean)
     
-    # Label connected regions
+    # Region analysis
     labeled_regions = measure.label(binary_clean)
-    region_props = measure.regionprops(labeled_regions)
+    regions = measure.regionprops(labeled_regions)
     
-    # Get region properties
-    if region_props:
-        avg_area = np.mean([prop.area for prop in region_props])
-        avg_perimeter = np.mean([prop.perimeter for prop in region_props])
-        avg_eccentricity = np.mean([prop.eccentricity for prop in region_props])
-        avg_solidity = np.mean([prop.solidity for prop in region_props])
-        num_regions = len(region_props)
+    if regions:
+        # Sort regions by area to focus on the main tumor region
+        regions.sort(key=lambda x: x.area, reverse=True)
+        main_region = regions[0]  # Largest region (assumed to be tumor)
+        
+        # Enhanced shape features
+        features.extend([
+            main_region.area,
+            main_region.perimeter,
+            main_region.eccentricity,
+            main_region.solidity,
+            main_region.extent,
+            main_region.euler_number,
+            main_region.orientation,
+            main_region.major_axis_length,
+            main_region.minor_axis_length,
+            main_region.perimeter / (2 * np.sqrt(np.pi * main_region.area))  # Circularity
+        ])
     else:
-        avg_area = avg_perimeter = avg_eccentricity = avg_solidity = num_regions = 0
-    
-    # Texture features using Local Binary Patterns
-    lbp = local_binary_pattern(image_normalized, LBP_N_POINTS, LBP_RADIUS, method='uniform')
-    lbp_hist, _ = np.histogram(lbp, bins=LBP_N_POINTS + 2, range=(0, LBP_N_POINTS + 2), density=True)
-    
-    # GLCM texture features with multiple distances and angles
+        features.extend([0] * 10)  # Padding for cases without regions
+
+    # Enhanced texture analysis
+    # Multi-scale LBP
+    for radius in [2, 3, 4]:
+        lbp = local_binary_pattern(image_normalized, 8 * radius, radius, method='uniform')
+        lbp_hist, _ = np.histogram(lbp, bins=10, density=True)
+        features.extend(lbp_hist)
+
+    # Enhanced GLCM features
     glcm_features = []
     for distance in DISTANCES:
         for angle in ANGLES:
-            glcm = graycomatrix((image_normalized * 255).astype(np.uint8), 
-                                distances=[distance], 
-                                angles=[angle], 
-                                levels=256, 
-                                symmetric=True, 
-                                normed=True)
+            glcm = graycomatrix(
+                (image_normalized * 255).astype(np.uint8),
+                distances=[distance],
+                angles=[angle],
+                levels=256,
+                symmetric=True,
+                normed=True
+            )
             
+            # Calculate additional GLCM properties
             glcm_features.extend([
                 graycoprops(glcm, 'contrast')[0, 0],
                 graycoprops(glcm, 'dissimilarity')[0, 0],
@@ -125,36 +170,16 @@ def extract_image_features(image: np.array):
                 graycoprops(glcm, 'ASM')[0, 0]
             ])
     
-    # Combine all features
-    features = [
-        mean_intensity, std_intensity, cv, skewness, kurtosis,
-        percentile_25, percentile_50, percentile_75,
-        avg_edge_strength, std_edge_strength, canny_edge_density,
-        avg_area, avg_perimeter, avg_eccentricity, avg_solidity, num_regions
-    ]
-    
-    # Add LBP histogram features
-    features.extend(lbp_hist)
-    
-    # Add GLCM features
     features.extend(glcm_features)
-    
-    # Ensure the feature vector has exactly 100 dimensions to match the trained model
+
+    # Ensure consistent feature dimension
     feature_dimension = 100
     if len(features) > feature_dimension:
-        # If we have more features than expected, select the most important ones
-        # Prioritize the first 16 main features, then select from remaining features to reach 100
-        main_features = features[:16]
-        remaining_needed = feature_dimension - 16
-        # Select evenly from LBP and GLCM features
-        selected_remaining = features[16:16+remaining_needed]
-        features = main_features + selected_remaining
+        features = features[:feature_dimension]
     elif len(features) < feature_dimension:
-        # If we have fewer features than expected, pad with zeros
-        padding = [0.0] * (feature_dimension - len(features))
-        features.extend(padding)
-    
-    return features
+        features.extend([0] * (feature_dimension - len(features)))
+
+    return np.array(features)
 
 @app.get("/")
 def read_root():
@@ -416,224 +441,174 @@ def analyze_growth_pattern(image_gray: np.array) -> dict:
         "infiltrative_score": 1.0 - min(1.0, edge_sharpness)  # Lower sharpness indicates infiltrative growth
     }
 
-def predict_tumor_type(characteristics: dict) -> dict:
-    """
-    Predicts tumor type based on calculated characteristics using medical formulas
-    """
-    # Initialize scores for each tumor type
-    scores = {
-        'adenocarcinoma': 0.0,
-        'squamous_cell': 0.0,
-        'large_cell': 0.0,
-        'small_cell': 0.0,
-        'metastatic': 0.0
-    }
+def extract_advanced_features(image: np.array) -> np.array:
+    """Enhanced feature extraction with comprehensive image analysis"""
+    if image.shape[-1] == 4:
+        image = color.rgba2rgb(image)
     
-    # Adenocarcinoma characteristics
-    scores['adenocarcinoma'] = calculate_adenocarcinoma_score(characteristics)
+    # Convert to grayscale and normalize
+    image_gray = color.rgb2gray(image)
+    image_normalized = (image_gray - np.min(image_gray)) / (np.max(image_gray) - np.min(image_gray))
     
-    # Squamous cell characteristics
-    scores['squamous_cell'] = calculate_squamous_cell_score(characteristics)
+    features = []
     
-    # Large cell characteristics
-    scores['large_cell'] = calculate_large_cell_score(characteristics)
+    # 1. Enhanced Statistical Features
+    intensity_stats = [
+        np.mean(image_normalized),
+        np.std(image_normalized),
+        skew(image_normalized.ravel()),
+        kurtosis(image_normalized.ravel()),
+        shannon_entropy(image_normalized)
+    ]
+    features.extend(intensity_stats)
     
-    # Small cell characteristics
-    scores['small_cell'] = calculate_small_cell_score(characteristics)
+    # 2. Multi-scale Texture Analysis
+    for radius in [1, 2, 3]:
+        # LBP features
+        lbp = local_binary_pattern(image_normalized, 8 * radius, radius, method='uniform')
+        lbp_hist, _ = np.histogram(lbp, bins=10, density=True)
+        features.extend(lbp_hist)
+        
+        # GLCM features at multiple angles
+        glcm = graycomatrix(
+            (image_normalized * 255).astype(np.uint8),
+            distances=[radius],
+            angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
+            levels=256,
+            symmetric=True,
+            normed=True
+        )
+        
+        glcm_features = [
+            graycoprops(glcm, 'contrast').mean(),
+            graycoprops(glcm, 'dissimilarity').mean(),
+            graycoprops(glcm, 'homogeneity').mean(),
+            graycoprops(glcm, 'energy').mean(),
+            graycoprops(glcm, 'correlation').mean(),
+            graycoprops(glcm, 'ASM').mean()
+        ]
+        features.extend(glcm_features)
     
-    # Metastatic characteristics
-    scores['metastatic'] = calculate_metastatic_score(characteristics)
-    
-    # Normalize scores
-    total = sum(scores.values())
-    if total > 0:
-        scores = {k: v/total for k, v in scores.items()}
-    
-    # Calculate confidence score
-    confidence = max(scores.values())
-    predicted_type = max(scores.items(), key=lambda x: x[1])[0]
-    
-    return {
-        "predicted_type": predicted_type,
-        "confidence": confidence,
-        "scores": scores
-    }
-
-# Tumor type-specific scoring functions
-def calculate_adenocarcinoma_score(chars: dict) -> float:
-    """
-    Ground-glass opacity, lepidic growth pattern, irregular margins
-    Updated weights based on medical literature
-    """
-    return (
-        (1 - chars['density_score']) * 0.35 +  # Ground-glass opacity (increased weight)
-        chars['texture_scores']['heterogeneity'] * 0.25 +  # Texture heterogeneity
-        chars['shape_metrics']['irregularity'] * 0.25 +    # Irregular margins
-        (1 - chars['shape_metrics']['sphericity']) * 0.15  # Non-spherical shape
+    # 3. Enhanced Edge and Gradient Analysis
+    # HOG features
+    hog_features = hog(
+        image_normalized,
+        orientations=9,
+        pixels_per_cell=(16, 16),
+        cells_per_block=(2, 2),
+        visualize=False
     )
-
-def calculate_squamous_cell_score(chars: dict) -> float:
-    """
-    Central location, cavitation, thick walls
-    """
-    return (
-        chars['density_score'] * 0.35 +                # Higher density
-        chars['shape_metrics']['sphericity'] * 0.25 +  # More spherical
-        chars['texture_scores']['uniformity'] * 0.25 + # More uniform
-        chars['growth_pattern']['boundary_strength'] * 0.15  # Well-defined margins
-    )
-
-def calculate_large_cell_score(chars: dict) -> float:
-    """
-    Large size, necrotic center, well-defined margins
-    """
-    return (
-        chars['shape_metrics']['sphericity'] * 0.25 +           # More spherical
-        (1 - chars['texture_scores']['uniformity']) * 0.35 +    # Less uniform (necrotic)
-        chars['growth_pattern']['boundary_strength'] * 0.25 +   # Well-defined margins
-        chars['density_score'] * 0.15                          # Higher density
-    )
-
-def calculate_small_cell_score(chars: dict) -> float:
-    """
-    Central location, rapid growth, vascular invasion
-    """
-    return (
-        chars['texture_scores']['vesselness'] * 0.35 +          # Vascular involvement
-        chars['growth_pattern']['infiltrative_score'] * 0.25 +  # Infiltrative pattern
-        chars['density_score'] * 0.25 +                        # Higher density
-        (1 - chars['shape_metrics']['sphericity']) * 0.15      # Less spherical
-    )
-
-def calculate_metastatic_score(chars: dict) -> float:
-    """
-    Multiple nodules, well-defined margins, round shape
-    """
-    return (
-        chars['shape_metrics']['sphericity'] * 0.35 +           # More spherical
-        chars['growth_pattern']['boundary_strength'] * 0.25 +   # Well-defined margins
-        chars['texture_scores']['uniformity'] * 0.25 +         # More uniform
-        chars['density_score'] * 0.15                          # Variable density
-    )
-
-def generate_plots(image_array, image_features, class_probabilities):
-    plots = {}
+    features.extend(hog_features[:20])  # Take first 20 HOG features
     
-    # Original image
-    plt.figure(figsize=(8, 8))
-    plt.imshow(image_array)
-    plt.title("Original Image")
-    plt.axis('off')
-    plots['original'] = plot_to_base64(plt)
+    # Multi-scale gradient analysis
+    for sigma in [1, 2, 4]:
+        grad_mag = filters.sobel(gaussian(image_normalized, sigma=sigma))
+        grad_features = [
+            np.mean(grad_mag),
+            np.std(grad_mag),
+            np.percentile(grad_mag, [25, 50, 75])
+        ]
+        features.extend(grad_features)
     
-    # Grayscale image
+    # 4. Frequency Domain Features
+    f_transform = fft2(image_normalized)
+    f_shift = fftshift(f_transform)
+    magnitude_spectrum = np.abs(f_shift)
+    freq_features = [
+        np.mean(magnitude_spectrum),
+        np.std(magnitude_spectrum),
+        np.max(magnitude_spectrum),
+        np.sum(magnitude_spectrum > np.mean(magnitude_spectrum))
+    ]
+    features.extend(freq_features)
+    
+    # 5. Shape and Region Properties
+    thresh = filters.threshold_otsu(image_normalized)
+    binary = image_normalized > thresh
+    binary_clean = morphology.remove_small_objects(
+        morphology.binary_opening(binary),
+        min_size=50
+    )
+    
+    regions = measure.regionprops(measure.label(binary_clean))
+    if regions:
+        main_region = max(regions, key=lambda r: r.area)
+        shape_features = [
+            main_region.area,
+            main_region.perimeter,
+            main_region.eccentricity,
+            main_region.solidity,
+            main_region.extent,
+            main_region.euler_number,
+            main_region.equivalent_diameter
+        ]
+    else:
+        shape_features = [0] * 7
+    features.extend(shape_features)
+    
+    return np.array(features)
+
+# Add these imports at the top
+from scipy.stats import skew, kurtosis
+from skimage.filters import threshold_local
+
+# Add these constants after other constants
+NORMAL_TISSUE_THRESHOLDS = {
+    'entropy_min': 0.6,
+    'contrast_min': 0.15,
+    'homogeneity_max': 0.9,
+    'vessel_density_min': 0.01,
+    'texture_uniformity_max': 0.8
+}
+
+def analyze_normal_tissue(image_array: np.array) -> tuple[bool, float]:
+    """
+    Analyzes if the image shows normal lung tissue
+    Returns (is_normal, confidence)
+    """
     image_gray = color.rgb2gray(image_array)
-    plt.figure(figsize=(8, 8))
-    plt.imshow(image_gray, cmap='gray')
-    plt.title("Grayscale Image")
-    plt.axis('off')
-    plots['grayscale'] = plot_to_base64(plt)
     
-    # Histogram
-    plt.figure(figsize=(10, 5))
-    plt.hist(image_gray.ravel(), bins=256, color='blue', alpha=0.7)
-    plt.title('Intensity Histogram')
-    plt.xlabel('Intensity Value')
-    plt.ylabel('Frequency')
-    plt.grid()
-    plots['histogram'] = plot_to_base64(plt)
+    # 1. Tissue Pattern Analysis
+    entropy_score = shannon_entropy(image_gray) / np.log2(256)
     
-    # Edge detection
-    edges = filters.sobel(image_gray)
-    plt.figure(figsize=(15, 5))
-    plt.subplot(1, 2, 1)
-    plt.imshow(image_gray, cmap='gray')
-    plt.title('Original Grayscale Image')
-    plt.axis('off')
-    plt.subplot(1, 2, 2)
-    plt.imshow(edges, cmap='hot')
-    plt.title('Sobel Edge Detection Result')
-    plt.axis('off')
-    plots['edge_detection'] = plot_to_base64(plt)
+    # 2. Vessel Analysis
+    hessian_matrices = hessian_matrix(image_gray, sigma=1.0)
+    eigenvalues = hessian_matrix_eigvals(hessian_matrices)
+    vessel_density = np.mean(np.abs(eigenvalues[0])) / np.mean(np.abs(eigenvalues[1]))
     
-    # Binary segmentation
-    thresh = filters.threshold_otsu(image_gray)
-    binary = image_gray > thresh
-    binary_clean = morphology.binary_opening(binary)
-    binary_clean = morphology.binary_closing(binary_clean)
+    # 3. Texture Analysis
+    glcm = graycomatrix(
+        (image_gray * 255).astype(np.uint8),
+        distances=[1],
+        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
+        levels=256,
+        symmetric=True,
+        normed=True
+    )
     
-    plt.figure(figsize=(15, 5))
-    plt.subplot(1, 3, 1)
-    plt.imshow(image_gray, cmap='gray')
-    plt.title('Original')
-    plt.axis('off')
-    plt.subplot(1, 3, 2)
-    plt.imshow(binary, cmap='gray')
-    plt.title('Thresholded')
-    plt.axis('off')
-    plt.subplot(1, 3, 3)
-    plt.imshow(binary_clean, cmap='gray')
-    plt.title('Morphological Processing')
-    plt.axis('off')
-    plots['segmentation'] = plot_to_base64(plt)
+    contrast = graycoprops(glcm, 'contrast').mean()
+    homogeneity = graycoprops(glcm, 'homogeneity').mean()
+    uniformity = graycoprops(glcm, 'energy').mean()
     
-    # Classification probabilities
-    plt.figure(figsize=(12, 6))
-    classes = list(class_probabilities.keys())
-    probs = list(class_probabilities.values())
+    # 4. Local Intensity Variation
+    local_thresh = threshold_local(image_gray, block_size=35, method='gaussian')
+    intensity_variation = np.mean(np.abs(image_gray - local_thresh))
     
-    # Sort by probability
-    sorted_indices = np.argsort(probs)[::-1]
-    classes = [classes[i] for i in sorted_indices]
-    probs = [probs[i] for i in sorted_indices]
+    # Calculate normal tissue probability
+    normal_scores = [
+        1.0 if entropy_score > NORMAL_TISSUE_THRESHOLDS['entropy_min'] else entropy_score / NORMAL_TISSUE_THRESHOLDS['entropy_min'],
+        1.0 if contrast > NORMAL_TISSUE_THRESHOLDS['contrast_min'] else contrast / NORMAL_TISSUE_THRESHOLDS['contrast_min'],
+        1.0 if homogeneity < NORMAL_TISSUE_THRESHOLDS['homogeneity_max'] else NORMAL_TISSUE_THRESHOLDS['homogeneity_max'] / homogeneity,
+        1.0 if vessel_density > NORMAL_TISSUE_THRESHOLDS['vessel_density_min'] else vessel_density / NORMAL_TISSUE_THRESHOLDS['vessel_density_min'],
+        1.0 if uniformity < NORMAL_TISSUE_THRESHOLDS['texture_uniformity_max'] else NORMAL_TISSUE_THRESHOLDS['texture_uniformity_max'] / uniformity
+    ]
     
-    # Create bar chart
-    bars = plt.bar(classes, probs, color='skyblue')
-    plt.xlabel('Tumor Type')
-    plt.ylabel('Probability')
-    plt.title('Classification Probabilities')
-    plt.xticks(rotation=45, ha='right')
-    plt.ylim(0, 1)
-    plt.tight_layout()
+    normal_probability = np.mean(normal_scores)
+    is_normal = normal_probability > 0.7
     
-    # Add value labels
-    for bar, prob in zip(bars, probs):
-        plt.text(bar.get_x() + bar.get_width()/2, 
-                 bar.get_height() + 0.01, 
-                 f'{prob:.2f}', 
-                 ha='center', va='bottom')
-    
-    plots['classification_probabilities'] = plot_to_base64(plt)
-    
-    # 3D surface plot of image intensities - more efficient implementation
-    # Downsample the image to make 3D plot more efficient
-    factor = max(1, int(min(image_gray.shape) / 50))
-    downsampled = image_gray[::factor, ::factor]
-    
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    x = np.arange(0, downsampled.shape[1], 1)
-    y = np.arange(0, downsampled.shape[0], 1)
-    X, Y = np.meshgrid(x, y)
-    surf = ax.plot_surface(X, Y, downsampled, cmap='viridis')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Intensity')
-    ax.set_title('3D Surface Plot of Image Intensities (Downsampled)')
-    fig.colorbar(surf, shrink=0.5, aspect=5)
-    plots['3d_surface'] = plot_to_base64(plt)
-    
-    return plots
+    return is_normal, normal_probability
 
-def plot_to_base64(plt):
-    """Converts matplotlib plot to base64 string."""
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode('utf-8')
-
-# Update your predict_tumor endpoint
+# Update the predict_tumor endpoint
 @app.post("/predict-tumor/")
 async def predict_tumor(file: UploadFile = File(...)):
     try:
@@ -642,28 +617,56 @@ async def predict_tumor(file: UploadFile = File(...)):
         image = Image.open(BytesIO(image_data)).convert("RGB")
         image_array = np.array(image)
         
-        # Validate CT scan
-        is_valid, validation_message = validate_lung_ct(image_array)
-        if not is_valid:
-            raise HTTPException(status_code=400, detail=validation_message)
+        # First, check if it's normal tissue
+        is_normal, normal_confidence = analyze_normal_tissue(image_array)
         
-        # Analyze tumor characteristics
-        characteristics = analyze_tumor_characteristics(image_array)
+        if is_normal and normal_confidence > 0.8:
+            return {
+                "tumor_type": "Normal Lung Tissue",
+                "confidence": float(normal_confidence),
+                "analysis": {
+                    "is_normal": True,
+                    "normal_confidence": float(normal_confidence)
+                }
+            }
         
-        # Predict tumor type
-        prediction_results = predict_tumor_type(characteristics)
+        # If not clearly normal, proceed with tumor analysis
+        features = extract_advanced_features(image_array)
         
-        # Generate visualization plots
-        plots = generate_plots(image_array, characteristics, prediction_results['scores'])
+        # Ensure model is trained
+        if not hasattr(model, "classes_"):
+            raise HTTPException(
+                status_code=503,
+                detail="Model not trained. Please train the model first."
+            )
+        
+        # Get prediction probabilities
+        probabilities = model.predict_proba([features])[0]
+        predicted_class = model.classes_[np.argmax(probabilities)]
+        confidence = float(np.max(probabilities))
+        
+        # Adjust confidence if there's significant normal tissue probability
+        if normal_confidence > 0.5:
+            confidence = confidence * (1 - normal_confidence)
+        
+        # Generate detailed analysis
+        analysis_results = analyze_tumor_characteristics(image_array)
         
         return {
-            "tumor_type": tumor_types.get(prediction_results['predicted_type'], "Unknown"),
-            "confidence": prediction_results['confidence'],
-            "characteristics": characteristics,
-            "class_probabilities": prediction_results['scores'],
-            "plots": plots
+            "tumor_type": tumor_types.get(predicted_class, "Unknown"),
+            "confidence": confidence,
+            "normal_tissue_probability": float(normal_confidence),
+            "analysis": {
+                "is_normal": is_normal,
+                "normal_confidence": float(normal_confidence),
+                "tumor_characteristics": analysis_results,
+                "feature_importance": dict(zip(
+                    ["feature_" + str(i) for i in range(len(features))],
+                    model.feature_importances_.tolist()
+                ))
+            }
         }
-    
+        
     except Exception as e:
         raise HTTPException(
             status_code=400,
