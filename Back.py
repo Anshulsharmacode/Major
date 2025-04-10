@@ -22,6 +22,7 @@ from skimage.measure import shannon_entropy
 from scipy import signal, stats
 from scipy.fft import fft2, fftshift
 from skimage import transform
+from datetime import datetime
 
 # Initialize FastAPI
 app = FastAPI()
@@ -465,22 +466,22 @@ def analyze_tumor_characteristics(image_array: np.array) -> dict:
     
     # Adenocarcinoma score (peripheral, GGO, spiculated)
     tumor_type_scores["adenocarcinoma"] = (
-        location["peripheral_score"] * 0.3 +
-        ground_glass["ggo_score"] * 0.4 +
-        spiculation["spiculation_score"] * 0.3
+        location["peripheral_score"] * 0.35 +  # Increase weight for peripheral location
+        ground_glass["ggo_score"] * 0.35 +     # Maintain high weight for GGO
+        spiculation["spiculation_score"] * 0.30 # Keep spiculation as important factor
     )
     
     # Squamous cell score (central, cavitation)
     tumor_type_scores["squamous_cell"] = (
-        location["central_score"] * 0.5 +
-        cavitation["cavitation_score"] * 0.5
+        location["central_score"] * 0.40 +
+        cavitation["cavitation_score"] * 0.25
     )
     
     # Large cell score (large, irregular, infiltrative)
     tumor_type_scores["large_cell"] = (
-        shape_metrics["irregularity"] * 0.4 +
-        growth_pattern["infiltrative_score"] * 0.3 +
-        (1.0 - shape_metrics["sphericity"]) * 0.3
+        shape_metrics["max_diameter"] * 0.35 +     # Increase emphasis on size
+        (1.0 - shape_metrics["irregularity"]) * 0.35 + # Well-defined borders
+        location["peripheral_score"] * 0.30        # Peripheral location
     )
     
     # Small cell score (central, high density)
@@ -502,17 +503,17 @@ def analyze_tumor_characteristics(image_array: np.array) -> dict:
         (1.0 - growth_pattern["infiltrative_score"]) * 0.3
     )
     
-    # Hamartoma score (well-circumscribed, calcification pattern)
-    tumor_type_scores["hamartoma"] = (
-        (1.0 - spiculation["spiculation_score"]) * 0.5 +
-        shape_metrics["sphericity"] * 0.5
-    )
+    # # Hamartoma score (well-circumscribed, calcification pattern)
+    # tumor_type_scores["hamartoma"] = (
+    #     (1.0 - spiculation["spiculation_score"]) * 0.5 +
+    #     shape_metrics["sphericity"] * 0.5
+    # )
     
-    # Pulmonary adenoma score (small, homogeneous, smooth margins)
-    tumor_type_scores["pulmonary_adenoma"] = (
-        (1.0 - texture_scores["heterogeneity"]) * 0.5 +
-        (1.0 - spiculation["spiculation_score"]) * 0.5
-    )
+    # # Pulmonary adenoma score (small, homogeneous, smooth margins)
+    # tumor_type_scores["pulmonary_adenoma"] = (
+    #     (1.0 - texture_scores["heterogeneity"]) * 0.5 +
+    #     (1.0 - spiculation["spiculation_score"]) * 0.5
+    # )
     
     return {
         "density_score": density_score,
@@ -680,122 +681,135 @@ def validate_lung_ct(image_array: np.array) -> tuple:
     
     return True, "Valid lung CT scan detected."
 
-def analyze_normal_tissue(image_array: np.array) -> tuple:
+def analyze_normal_tissue(image_array: np.array) -> dict:
     """
-    Analyzes if the image shows normal lung tissue without tumors
-    Returns (is_normal, confidence)
+    Analyzes if the image shows normal lung tissue without tumors.
+    Uses multiple criteria specific to normal lung CT appearance.
     """
-    # Convert to grayscale if not already
-    if len(image_array.shape) > 2 and image_array.shape[2] > 1:
-        image_gray = color.rgb2gray(image_array)
-    else:
-        image_gray = image_array
+    image_gray = color.rgb2gray(image_array) if len(image_array.shape) > 2 else image_array
     
-    # 1. Enhanced texture uniformity with anatomical consideration
+    # 1. Normal Lung Density Distribution
+    hist, bins = np.histogram(image_gray, bins=50, density=True)
+    
+    # Normal lungs should show clear bimodal distribution (air and tissue)
+    peaks, _ = signal.find_peaks(hist, distance=5)
+    peak_values = hist[peaks]
+    if len(peaks) >= 2:
+        bimodal_score = 1.0
+    else:
+        bimodal_score = 0.3
+
+    # 2. Bronchial Tree Pattern
+    # Normal lungs show branching vessel patterns
+    edges = filters.sobel(image_gray)
+    thin_edges = feature.canny(image_gray, sigma=2)
+    
+    # Calculate branching pattern score using skeletonize and label
+    skeleton = morphology.skeletonize(thin_edges)
+    # Create a structuring element for branch points
+    branch_struct = np.array([
+        [0, 1, 0],
+        [1, 1, 1],
+        [0, 1, 0]
+    ])
+    # Use binary_erosion and binary_dilation instead of binary_hit_or_miss
+    branch_points = np.sum(
+        morphology.binary_dilation(skeleton, branch_struct) & 
+        ~morphology.binary_erosion(skeleton, branch_struct)
+    )
+    branching_score = min(1.0, branch_points / 50)  # Normalize
+
+    # 3. Vessel Distribution
+    # Normal lungs have gradually diminishing vessels from hilum to periphery
+    h, w = image_gray.shape
+    center_y, center_x = h//2, w//2
+    
+    y_coords, x_coords = np.where(thin_edges)
+    if len(y_coords) > 0:
+        distances = np.sqrt((y_coords - center_y)**2 + (x_coords - center_x)**2)
+        dist_hist, _ = np.histogram(distances, bins=10)
+        vessel_gradient = np.mean(np.diff(dist_hist))
+        vessel_score = 1.0 if vessel_gradient < 0 else 0.5  # Should decrease from center
+    else:
+        vessel_score = 0.0
+
+    # 4. Texture Uniformity
     glcm = graycomatrix(
-        (image_gray * 255).astype(np.uint8), 
-        distances=[1, 3, 5], 
-        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4], 
+        (image_gray * 255).astype(np.uint8),
+        distances=[1],
+        angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
         levels=256,
-        symmetric=True, 
+        symmetric=True,
         normed=True
     )
+    
     homogeneity = graycoprops(glcm, 'homogeneity').mean()
-    energy = graycoprops(glcm, 'energy').mean()
-    texture_uniformity = (homogeneity + energy) / 2
+    correlation = graycoprops(glcm, 'correlation').mean()
     
-    # 2. Improved edge density with anatomical structure consideration
-    edges = filters.sobel(image_gray)
-    edge_density = np.mean(edges)
-    
-    # Calculate edge orientation histogram to detect natural anatomical curves
-    edge_angles = np.arctan2(filters.sobel(image_gray, axis=0), filters.sobel(image_gray, axis=1))
-    hist_angles, _ = np.histogram(edge_angles[edges > np.mean(edges)], bins=16)
-    angle_uniformity = np.std(hist_angles) / np.mean(hist_angles) if np.mean(hist_angles) > 0 else 0
-    
-    # 3. Enhanced shape analysis for anatomical structures
+    # Normal tissue should have relatively uniform texture
+    texture_score = (homogeneity + correlation) / 2
+
+    # 5. Abnormal Dense Objects
+    # Look for suspicious dense objects
     thresh = filters.threshold_otsu(image_gray)
     binary = image_gray > thresh
-    binary_clean = morphology.binary_opening(binary)
-    labeled_regions = measure.label(binary_clean)
-    regions = measure.regionprops(labeled_regions)
+    labeled = measure.label(binary)
+    regions = measure.regionprops(labeled)
     
-    shape_irregularity = 0
-    anatomical_score = 0
+    suspicious_objects = 0
+    for region in regions:
+        # Check for characteristics of tumors
+        if (region.area > 100 and  # Not too small
+            region.eccentricity < 0.9 and  # Somewhat round
+            region.solidity > 0.8):  # Solid mass
+            suspicious_objects += 1
     
-    if regions:
-        # Analyze shapes considering normal anatomical structures
-        circularity_values = []
-        sizes = []
-        locations = []
-        
-        h, w = image_gray.shape
-        center_y, center_x = h // 2, w // 2
-        
-        for region in regions:
-            if region.area > 100:
-                # Calculate circularity
-                perimeter = region.perimeter
-                area = region.area
-                if perimeter > 0:
-                    circularity = 4 * np.pi * area / (perimeter * perimeter)
-                    circularity_values.append(circularity)
-                    sizes.append(area)
-                    
-                    # Check location relative to image center (for heart position)
-                    y, x = region.centroid
-                    dist_to_center = np.sqrt(((y - center_y) / (h/2))**2 + ((x - center_x) / (w/2))**2)
-                    locations.append(dist_to_center)
-        
-        if circularity_values:
-            shape_irregularity = 1 - np.mean(circularity_values)
-            
-            # Score for normal anatomical distribution
-            size_variation = np.std(sizes) / np.mean(sizes) if sizes else 1
-            location_distribution = np.std(locations) if locations else 1
-            anatomical_score = 1.0 - (size_variation * 0.5 + location_distribution * 0.5)
-    
-    # 4. Enhanced intensity distribution analysis
-    hist, bin_edges = np.histogram(image_gray, bins=50, density=True)
-    entropy_value = entropy(hist)
-    
-    # Analyze intensity peaks for normal tissue patterns
-    peaks, _ = signal.find_peaks(hist, distance=5)
-    peak_heights = hist[peaks] if len(peaks) > 0 else [0]
-    peak_distribution = np.std(peak_heights) / np.mean(peak_heights) if len(peak_heights) > 0 else 1
-    
-    # 5. Improved suspicious area detection
-    suspicious_areas = binary_clean & (image_gray > np.percentile(image_gray, 75))
-    suspicious_density = np.sum(suspicious_areas) / image_gray.size
-    
-    # 6. Calculate symmetry score
-    # Flip the image horizontally and compare
-    flipped = np.fliplr(image_gray)
-    symmetry_score = 1 - np.mean(np.abs(image_gray - flipped))
-    
-    # Enhanced normal tissue scoring with anatomical considerations
-    normal_indicators = [
-        texture_uniformity > 0.75,          # Relaxed texture uniformity for anatomical structures
-        edge_density < 0.15,                # Adjusted for natural anatomical edges
-        shape_irregularity < 0.3,           # Relaxed for natural anatomical shapes
-        entropy_value < 3.5,                # Adjusted for normal tissue variation
-        suspicious_density < 0.05,          # Relaxed for normal anatomical structures
-        anatomical_score > 0.6,             # New anatomical structure score
-        symmetry_score > 0.7,               # New bilateral symmetry score
-        angle_uniformity < 0.5              # New edge orientation uniformity
-    ]
-    
-    # Updated weights considering anatomical structures
-    weights = [0.15, 0.15, 0.15, 0.1, 0.15, 0.1, 0.1, 0.1]
-    normal_confidence = sum(w * i for w, i in zip(weights, normal_indicators))
-    
-    # Adjust confidence based on additional anatomical considerations
-    if anatomical_score > 0.8 and symmetry_score > 0.8:
-        normal_confidence = min(1.0, normal_confidence * 1.2)
-    
-    is_normal = normal_confidence > 0.65  # Slightly reduced threshold to account for anatomical structures
-    
-    return is_normal, normal_confidence
+    abnormality_score = min(1.0, suspicious_objects / 3)
+    clear_lung_score = 1.0 - abnormality_score
+
+    # 6. Symmetry Analysis
+    left_half = image_gray[:, :center_x]
+    right_half = np.fliplr(image_gray[:, center_x:])
+    # Adjust size if halves are unequal
+    min_width = min(left_half.shape[1], right_half.shape[1])
+    symmetry_score = 1 - np.mean(np.abs(left_half[:, :min_width] - right_half[:, :min_width]))
+
+    # Combine all scores with weighted importance
+    weights = {
+        'bimodal': 0.2,
+        'branching': 0.15,
+        'vessels': 0.15,
+        'texture': 0.15,
+        'clear_lung': 0.2,
+        'symmetry': 0.15
+    }
+
+    normal_confidence = (
+        weights['bimodal'] * bimodal_score +
+        weights['branching'] * branching_score +
+        weights['vessels'] * vessel_score +
+        weights['texture'] * texture_score +
+        weights['clear_lung'] * clear_lung_score +
+        weights['symmetry'] * symmetry_score
+    )
+
+    # Decision thresholds
+    is_normal = (normal_confidence > 0.7 and 
+                suspicious_objects == 0 and 
+                symmetry_score > 0.6 and 
+                bimodal_score > 0.7)
+
+    return {
+        "is_normal": is_normal,
+        "normal_confidence": float(normal_confidence),
+        "characteristics": {
+            "bimodal_score": bimodal_score,
+            "vessel_score": vessel_score,
+            "texture_score": texture_score,
+            "symmetry_score": symmetry_score,
+            "suspicious_objects": suspicious_objects
+        }
+    }
 
 def calculate_density_score(image_gray: np.array) -> float:
     """
@@ -985,7 +999,24 @@ async def predict_tumor(file: UploadFile = File(...)):
             }
         
         # Check if it's normal tissue
-        is_normal, normal_confidence = analyze_normal_tissue(image_array)
+        # Get normal tissue analysis results
+        analysis_result = analyze_normal_tissue(image_array)
+        is_normal = analysis_result["is_normal"]
+        normal_confidence = analysis_result["normal_confidence"]
+        
+        if is_normal and normal_confidence > 0.7:
+            return {
+                "tumor_type": "Normal",
+                "predicted_label": "Normal Lung Tissue",
+                "confidence": normal_confidence,
+                "tumor_likelihood_score": 0.0,
+                "accuracy": float(normal_confidence * 100),
+                "normal_tissue_probability": normal_confidence,
+                "analysis": {
+                    "is_normal": True,
+                    "normal_characteristics": analysis_result["characteristics"]
+                }
+            }
         
         # Detailed tumor analysis using our enhanced analytical methods
         analysis_results = analyze_tumor_characteristics(image_array)
@@ -1048,46 +1079,31 @@ async def predict_tumor(file: UploadFile = File(...)):
             final_confidence = normal_confidence
             
         # Create visualization data for the UI
-        # Generate simple visualization of potential tumor regions
         try:
-            plt.figure(figsize=(10, 10))
-            # Create a visualization of the segmentation
-            image_gray = color.rgb2gray(image_array)
-            thresh = filters.threshold_otsu(image_gray)
-            binary = image_gray > thresh
-            binary_clean = morphology.binary_opening(binary)
-            
-            plt.subplot(121)
-            plt.imshow(image_gray, cmap='gray')
-            plt.title('Original CT Scan')
-            plt.axis('off')
-            
-            plt.subplot(122)
-            plt.imshow(image_gray, cmap='gray')
-            plt.imshow(binary_clean, cmap='hot', alpha=0.3)
-            plt.title('Region Analysis')
-            plt.axis('off')
-            
-            # Save plot to base64 string for UI
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png')
-            buf.seek(0)
-            plot_data = base64.b64encode(buf.read()).decode('utf-8')
-            plt.close()
+            # Generate all plots with proper error handling
+            from plot import plots
+            all_plots = plots['generate_plots'](image_array, {
+                'tumor_characteristics': analysis_results,
+                'tumor_type_scores': tumor_type_scores,
+                'ground_glass': analysis_results.get("ground_glass", {}),
+                'cavitation': analysis_results.get("cavitation", {})
+            })
         except Exception as plot_error:
             print(f"Plot generation error: {str(plot_error)}")
-            plot_data = ""
-        
-        # Return enhanced response including fields expected by UI
+            all_plots = {}
+
         return {
+            # Basic classification results
             "tumor_type": tumor_types.get(final_type, "Unknown"),
-            "predicted_label": tumor_types.get(final_type, "Unknown"),  # For UI compatibility
+            "predicted_label": tumor_types.get(final_type, "Unknown"),
             "confidence": float(final_confidence),
-            "tumor_likelihood_score": float(1.0 - normal_confidence),  # For UI compatibility
-            "accuracy": float(final_confidence * 100),  # As percentage for UI
+            "tumor_likelihood_score": float(1.0 - normal_confidence),
+            "accuracy": float(final_confidence * 100),
             "normal_tissue_probability": float(normal_confidence),
+            
+            # Detailed analysis results
             "analysis": {
-                "is_normal": bool(is_normal),  # Convert numpy.bool_ to Python bool
+                "is_normal": bool(is_normal),
                 "normal_confidence": float(normal_confidence),
                 "tumor_characteristics": {
                     "density_score": float(analysis_results["density_score"]),
@@ -1102,7 +1118,7 @@ async def predict_tumor(file: UploadFile = File(...)):
                     },
                     "nodule_analysis": {
                         "nodule_count": int(analysis_results["nodule_analysis"]["nodule_count"]),
-                        "has_multiple_nodules": bool(analysis_results["nodule_analysis"]["has_multiple_nodules"]),
+                    "has_multiple_nodules": bool(analysis_results["nodule_analysis"]["has_multiple_nodules"]),
                         "size_variation": float(analysis_results["nodule_analysis"]["size_variation"]),
                         "metastatic_pattern_score": float(analysis_results["nodule_analysis"]["metastatic_pattern_score"])
                     },
@@ -1112,7 +1128,7 @@ async def predict_tumor(file: UploadFile = File(...)):
                     },
                     "ground_glass": {
                         "has_ground_glass_opacity": bool(analysis_results["ground_glass"]["has_ground_glass_opacity"]),
-                        "ggo_score": float(analysis_results["ground_glass"]["ggo_score"]),
+                    "ggo_score": float(analysis_results["ground_glass"]["ggo_score"]),
                         "vessel_preservation": float(analysis_results["ground_glass"]["vessel_preservation"])
                     },
                     "spiculation": {
@@ -1122,7 +1138,7 @@ async def predict_tumor(file: UploadFile = File(...)):
                     "tumor_type_scores": {k: float(v) for k, v in analysis_results["tumor_type_scores"].items()}
                 },
                 "description": descriptions.get(final_type, "Unknown tumor pattern"),
-                "tumor_type_scores": {k: float(v) for k, v in tumor_type_scores.items()},
+                "tumor_type_scores": tumor_type_scores,
                 "location_analysis": {
                     "is_central": bool(analysis_results["location"]["is_central"]),
                     "is_peripheral": bool(analysis_results["location"]["is_peripheral"]),
@@ -1135,8 +1151,33 @@ async def predict_tumor(file: UploadFile = File(...)):
                     "has_cavitation": bool(analysis_results["cavitation"]["has_cavitation"])
                 }
             },
-            "plots": {
-                "region_analysis": plot_data
+            
+            # All available plots
+            "plots": all_plots,
+            
+            # Suggested plot display order
+            "plot_order": [
+                "original_grayscale",        # Original and grayscale image
+                "basic_segmentation",        # Basic tumor segmentation
+                "segmentation",             # Advanced tumor segmentation
+                "feature_analysis",         # Comprehensive feature analysis
+                "texture",                  # Texture analysis
+                "frequency",                # Frequency domain analysis
+                "multiscale",              # Multi-scale feature analysis
+                "tumor_type_scores",        # Tumor type probability scores
+                "ground_glass_opacity",     # Ground glass opacity analysis
+                "cavitation_analysis"       # Cavitation pattern analysis
+            ],
+            
+            # Add metadata about the analysis
+            "metadata": {
+                "analysis_version": "1.0",
+                "processing_timestamp": str(datetime.now()),
+                "image_dimensions": {
+                    "width": image_array.shape[1],
+                    "height": image_array.shape[0],
+                    "channels": image_array.shape[2] if len(image_array.shape) > 2 else 1
+                }
             }
         }
         
